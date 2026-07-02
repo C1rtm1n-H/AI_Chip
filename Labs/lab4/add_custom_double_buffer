@@ -1,0 +1,146 @@
+/**
+ * @file add_custom.cpp
+ *
+ * Copyright (C) 2024. Huawei Technologies Co., Ltd. All rights reserved.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ */
+#include "kernel_operator.h"
+
+using namespace AscendC;
+
+constexpr int32_t TOTAL_LENGTH = 1024 * 256;                          // total length of data
+constexpr int32_t USE_CORE_NUM = 1;                                   // num of core used
+constexpr int32_t BLOCK_LENGTH = TOTAL_LENGTH / USE_CORE_NUM;         // length computed of each core
+constexpr int32_t TILE_NUM = 8;                                       // split data into 8 tiles for each core
+constexpr int32_t BUFFER_NUM = 2;                                     // change to 2 when enabling double buffer
+constexpr int32_t TILE_LENGTH = BLOCK_LENGTH / TILE_NUM / BUFFER_NUM; // tensor num handled in each loop
+
+class KernelAdd {
+public:
+    __aicore__ inline KernelAdd() {}
+    __aicore__ inline void Init(GM_ADDR x, GM_ADDR z)
+    {
+        // get start index for current core, core parallel
+        xGm.SetGlobalBuffer((__gm__ half*)x + BLOCK_LENGTH * GetBlockIdx(), BLOCK_LENGTH);
+        zGm.SetGlobalBuffer((__gm__ half*)z + BLOCK_LENGTH * GetBlockIdx(), BLOCK_LENGTH);
+
+        // pipe alloc memory to queue, the unit is Bytes.
+        // x contains odd rows and y contains even rows for processing logic.
+        // Each loop process TILE_LENGTH elements in total, half odd, half even.
+        pipe.InitBuffer(inQueueX, BUFFER_NUM, TILE_LENGTH / 2 * sizeof(half));
+        pipe.InitBuffer(inQueueY, BUFFER_NUM, TILE_LENGTH / 2 * sizeof(half));
+        pipe.InitBuffer(outQueueZ, BUFFER_NUM, TILE_LENGTH * sizeof(half));
+    }
+    __aicore__ inline void Process()
+    {
+        int32_t loopCount = TILE_NUM * BUFFER_NUM;
+        for (int32_t i = 0; i < loopCount; i++) {
+            CopyIn(i);
+            Compute(i);
+            CopyOut(i);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int32_t progress)
+    {
+        LocalTensor<half> xLocal = inQueueX.AllocTensor<half>();
+        LocalTensor<half> yLocal = inQueueY.AllocTensor<half>();
+
+        uint32_t offset = progress * TILE_LENGTH;
+        uint16_t rowBlockLen = 256 * sizeof(half) / 32; // 16 Blocks
+        uint16_t splitCount = 32;                       // 64行的一半
+
+        // 提取输入奇数行 (用于 Exp) -> 存储到 xLocal
+        DataCopyParams xParams;
+        xParams.blockCount = splitCount;
+        xParams.blockLen = rowBlockLen;
+        xParams.srcStride = rowBlockLen; // 跳过一行
+        xParams.dstStride = 0;
+        DataCopy(xLocal, xGm[offset + 256], xParams); // 从 index 1 开始
+
+        // 提取输入偶数行 (用于 Relu) -> 存储到 yLocal
+        DataCopyParams yParams;
+        yParams.blockCount = splitCount;
+        yParams.blockLen = rowBlockLen; // 16
+        yParams.srcStride = rowBlockLen;
+        yParams.dstStride = 0;
+        DataCopy(yLocal, xGm[offset], yParams); // 从 index 0 开始
+
+        inQueueX.EnQue(xLocal);
+        inQueueY.EnQue(yLocal);
+    }
+    __aicore__ inline void Compute(int32_t progress)
+    {
+        LocalTensor<half> xLocal = inQueueX.DeQue<half>(); // 奇数行输入
+        LocalTensor<half> yLocal = inQueueY.DeQue<half>(); // 偶数行输入
+        LocalTensor<half> zLocal = outQueueZ.AllocTensor<half>();
+
+        uint32_t halfTileLength = TILE_LENGTH / 2;
+        LocalTensor<half> zLocalExpRes = zLocal;                    // 前半段存 Exp 结果
+        LocalTensor<half> zLocalReluRes = zLocal[halfTileLength];   // 后半段存 Relu 结果
+
+        // 计算：奇数行输入 -> Exp -> 准备写到输出偶数行
+        Exp(zLocalExpRes, xLocal, halfTileLength);
+        // 计算：偶数行输入 -> Relu -> 准备写到输出奇数行
+        Relu(zLocalReluRes, yLocal, halfTileLength);
+
+        outQueueZ.EnQue<half>(zLocal);
+        inQueueX.FreeTensor(xLocal);
+        inQueueY.FreeTensor(yLocal);
+    }
+    __aicore__ inline void CopyOut(int32_t progress)
+    {
+        LocalTensor<half> zLocal = outQueueZ.DeQue<half>();
+        uint32_t offset = progress * TILE_LENGTH;
+        uint32_t halfTileLength = TILE_LENGTH / 2;
+
+        uint16_t rowBlockLen = 256 * sizeof(half) / 32;
+        uint16_t splitCount = 32;
+
+        // 将 Exp 结果 (zLocal 前部) 写到输出的偶数行 (0, 2, 4...)
+        DataCopyParams evenBack;
+        evenBack.blockCount = splitCount;
+        evenBack.blockLen = rowBlockLen;
+        evenBack.srcStride = 0;
+        evenBack.dstStride = rowBlockLen; 
+        DataCopy(zGm[offset], zLocal, evenBack);
+
+        // 将 Relu 结果 (zLocal 后部) 写到输出的奇数行 (1, 3, 5...)
+        DataCopyParams oddBack;
+        oddBack.blockCount = splitCount;
+        oddBack.blockLen = rowBlockLen;
+        oddBack.srcStride = 0;
+        oddBack.dstStride = rowBlockLen;
+        DataCopy(zGm[offset + 256], zLocal[halfTileLength], oddBack);
+
+        outQueueZ.FreeTensor(zLocal);
+    }
+
+private:
+    TPipe pipe;
+    // create queues for input, in this case depth is equal to buffer num
+    TQue<QuePosition::VECIN, BUFFER_NUM> inQueueX, inQueueY;
+    // create queue for output, in this case depth is equal to buffer num
+    TQue<QuePosition::VECOUT, BUFFER_NUM> outQueueZ;
+    GlobalTensor<half> xGm, zGm;
+};
+
+// implementation of kernel function
+extern "C" __global__ __aicore__ void add_custom(GM_ADDR x, GM_ADDR z)
+{
+    KernelAdd op;
+    op.Init(x, z);
+    op.Process();
+}
+
+#ifndef __CCE_KT_TEST__
+// call of kernel function
+void add_custom_do(uint32_t blockDim, void* stream, uint8_t* x, uint8_t* z)
+{
+    add_custom<<<blockDim, nullptr,stream>>>(x, z);
+}
+#endif
